@@ -3,11 +3,13 @@
 import os
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from subprocess import Popen
 
 from google.cloud import storage
+import boto3
+from botocore.exceptions import ClientError
 
 from ..environment.environment import Environment
 
@@ -23,8 +25,17 @@ except ImportError as error:
 @dataclass
 class Terraform:
     environment: Environment
+    cloud_provider: str = field(default_factory=lambda: os.environ.get("TERRAFORM_BACKEND_PROVIDER", "gcp"))
 
     def init(self):
+        if self.cloud_provider.lower() == "aws":
+            self._init_aws()
+        elif self.cloud_provider.lower() == "gcp":
+            self._init_gcp()
+        else:
+            raise ValueError(f"Unsupported cloud provider: {self.cloud_provider}. Supported providers: gcp, aws")
+
+    def _init_gcp(self):
         bucket = "".join(
             [
                 f"{self.environment.org_id}-terraform-state-",
@@ -44,6 +55,27 @@ class Terraform:
         print(f"state: gs://{bucket}/terraform.state\n")
         self._exec(command)
 
+    def _init_aws(self):
+        bucket = "".join(
+            [
+                f"{self.environment.org_id}-terraform-state-",
+                f"{self.environment.region}",
+                f"-{self.environment.environment}",
+                f"-{self.environment.deployment}",
+            ]
+        )
+
+        command = "".join(
+            [
+                f"terraform init -backend-config=bucket={bucket}",
+                f" -backend-config=key=terraform.state",
+                f" -backend-config=region={self.environment.region}",
+            ]
+        )
+
+        print(f"state: s3://{bucket}/terraform.state\n")
+        self._exec(command)
+
     def modules_update(self):
         cwd = os.environ["PWD"]
         modules_file = Path(cwd, ".terraform/modules/modules.json")
@@ -58,12 +90,21 @@ class Terraform:
         )
 
         if modules_file.exists():
-            self._upload_blob(
-                self.environment.project_id,
-                bucket_name,
-                str(modules_file),
-                "terraform.modules/modules.json",
-            )
+            if self.cloud_provider.lower() == "aws":
+                self._upload_s3_object(
+                    bucket_name,
+                    str(modules_file),
+                    "terraform.modules/modules.json",
+                )
+            elif self.cloud_provider.lower() == "gcp":
+                self._upload_blob(
+                    self.environment.project_id,
+                    bucket_name,
+                    str(modules_file),
+                    "terraform.modules/modules.json",
+                )
+            else:
+                raise ValueError(f"Unsupported cloud provider: {self.cloud_provider}")
         else:
             print(f"File not found: {modules_file}")
             print(f"Please generate modules file by running an apply")
@@ -101,10 +142,22 @@ class Terraform:
             self._exec("terraform destroy")
 
     def tfsec(self):
-        # * ignore GCP002 error about unencrypted buckets since buckets are
-        #   encrypted by default, see: https://github.com/liamg/tfsec/issues/137
+        # Build exclude list based on cloud provider
+        excludes = []
+        
+        if self.cloud_provider.lower() == "gcp":
+            # ignore GCP002 error about unencrypted buckets since buckets are
+            # encrypted by default, see: https://github.com/liamg/tfsec/issues/137
+            excludes.append("GCP002")
+        elif self.cloud_provider.lower() == "aws":
+            # Add any AWS-specific exclusions here if needed
+            # For example: excludes.append("AWS017")
+            pass
+        
+        exclude_args = [f"--exclude={exclude}" for exclude in excludes]
+        
         output = (
-            tfsec(".", "--exclude=GCP002", _ok_code=[0, 1, 2])
+            tfsec(".", *exclude_args, _ok_code=[0, 1, 2])
                 .stdout.decode("UTF-8")
                 .rstrip()
         )
@@ -138,7 +191,7 @@ class Terraform:
     def _upload_blob(
             self, project_id, bucket_name, source_file_name, destination_blob_name
     ):
-        """Uploads a file to the bucket."""
+        """Uploads a file to the GCS bucket."""
         # project_id = "gcp project ID with which to associate quota"
         # The ID of your GCS bucket
         # bucket_name = "your-bucket-name"
@@ -154,3 +207,20 @@ class Terraform:
         blob.upload_from_filename(source_file_name)
 
         print(f"Uploaded module data to gs://{bucket_name}/{destination_blob_name}")
+
+    def _upload_s3_object(self, bucket_name, source_file_name, destination_object_name):
+        """Uploads a file to the S3 bucket."""
+        # bucket_name = "your-s3-bucket-name"
+        # The path to your file to upload
+        # source_file_name = "local/path/to/file"
+        # The S3 object name
+        # destination_object_name = "s3-object-name"
+
+        s3_client = boto3.client('s3')
+        
+        try:
+            s3_client.upload_file(source_file_name, bucket_name, destination_object_name)
+            print(f"Uploaded module data to s3://{bucket_name}/{destination_object_name}")
+        except ClientError as e:
+            print(f"Error uploading file to S3: {e}")
+            raise
